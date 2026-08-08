@@ -125,6 +125,17 @@ time.sleep(0.3)
 tick()
 check("EOF still closes conn", mod is not None)  # no crash; poll handles it
 
+# --- TEST 4: info.json self-heal (v1.0.4) — poll rewrites it every ~5s ---
+import pathlib
+info_path = pathlib.Path(mod.INFO_PATH)
+info_path.unlink(missing_ok=True)
+check("info.json deleted for self-heal test", not info_path.exists())
+time.sleep(0.05)
+for _ in range(3):
+    tick()
+info = json.loads(info_path.read_text()) if info_path.exists() else None
+check("info.json self-healed by poll", info is not None and info.get("port") == PORT)
+
 srv.close()
 mod._srv = None
 mod._started = False

@@ -672,8 +672,10 @@ def stop_service():
             bpy.app.timers.unregister(_timer_fn)
         _timer_fn = None
     if _srv is not None:
-        with contextlib.suppress(Exception):
+        try:
             _srv.close()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[blender-agent-mcp] warning: socket close failed: {exc}", file=sys.stderr, flush=True)
         _srv = None
     _started = False
     _token = ""
@@ -701,10 +703,18 @@ def _make_timer():
     executes them on the main thread (bpy-safe), replies, repeats."""
     global _request_count
     st = {"conn": None, "buf": b"", "authed": False}
+    _last_info_write = 0.0
 
     def poll():
+        nonlocal _last_info_write
         if not _started or _srv is None:
             return None
+        # self-heal the handshake file — if anything deleted info.json,
+        # rewrite it on the next tick (instant), plus a 5s heartbeat
+        now = time.time()
+        if not INFO_PATH.exists() or now - _last_info_write > 5.0:
+            _write_info()
+            _last_info_write = now
         if st["conn"] is None:
             try:
                 conn, _ = _srv.accept()
