@@ -509,6 +509,19 @@ def run_code(code, mode="exec"):
     }
 
 
+def warmup_undo():
+    """Background mode disables undo at startup; two undo_push() calls
+    initialize the undo system so ed.undo()/redo() work afterwards.
+    GUI mode is already initialized — never touch its undo stack."""
+    if not bpy.app.background:
+        return
+    for _ in range(2):
+        try:
+            bpy.ops.ed.undo_push(message="agent warmup")
+        except Exception:  # noqa: BLE001
+            break
+
+
 def push_checkpoint():
     """Push an undo step so a failed script can be fully reverted with one undo()."""
     try:
@@ -630,6 +643,7 @@ def start_service():
     srv.listen(4)
     srv.setblocking(False)
     _srv, _port, _started = srv, port, True
+    warmup_undo()
     _write_info()
     if bpy.app.background:
         return {"ok": True, "port": _port, "mode": "background"}
