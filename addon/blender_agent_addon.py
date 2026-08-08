@@ -630,7 +630,7 @@ def _send(conn, obj):
 
 def start_service():
     """Bind the socket and (in GUI mode) register the poll timer."""
-    global _srv, _timer_fn, _token, _port, _started
+    global _srv, _timer_fn, _token, _port, _started, _last_error
     if _started:
         return {"ok": True, "message": "already running", "port": _port}
     _token = secrets.token_hex(16)
@@ -655,8 +655,13 @@ def start_service():
     if bpy.app.background:
         return {"ok": True, "port": _port, "mode": "background"}
     _timer_fn = _make_timer()
-    bpy.app.timers.register(_timer_fn, first_interval=0.05)
-    print(f"[blender-agent-mcp] Blender {bpy.app.version_string} service listening on 127.0.0.1:{_port}", flush=True)
+    try:
+        bpy.app.timers.register(_timer_fn, first_interval=0.05)
+    except Exception as exc:  # noqa: BLE001
+        _last_error = f"timer registration failed: {exc}"
+        _timer_fn = None  # panel draw will self-heal on next redraw
+    else:
+        print(f"[blender-agent-mcp] Blender {bpy.app.version_string} service listening on 127.0.0.1:{_port}", flush=True)
     return {"ok": True, "port": _port, "mode": "gui"}
 
 
@@ -716,10 +721,11 @@ def _make_timer():
         try:
             data = conn.recv(65536)
         except BlockingIOError:
-            data = b""
+            return 0.05  # no data yet — keep the connection, retry next tick
         except Exception:  # noqa: BLE001
             data = b""
         if data == b"":
+            # real EOF — client disconnected
             with contextlib.suppress(Exception):
                 conn.close()
             st["conn"] = None
@@ -843,6 +849,14 @@ class AGENTMCP_PT_panel(bpy.types.Panel):
     bl_category = "Agent"
 
     def draw(self, context):  # noqa: ARG002
+        # self-heal: if the poll timer died (Blender drops timers in rare
+        # startup states), re-register it — panel redraws guarantee this runs
+        if _started and _timer_fn is not None and _srv is not None:
+            try:
+                if not bpy.app.timers.is_registered(_timer_fn):
+                    bpy.app.timers.register(_timer_fn, first_interval=0.05)
+            except Exception:  # noqa: BLE001
+                pass
         layout = self.layout
         if _started:
             box = layout.box()
