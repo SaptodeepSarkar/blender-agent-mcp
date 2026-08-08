@@ -540,6 +540,13 @@ def do_undo():
 
 
 def do_redo():
+    """GUI: native redo. Background: disabled — bpy.ops.ed.redo() segfaults
+    Blender 5.2 when the undo stack has 3+ pushes (verified 2026-08-08)."""
+    if bpy.app.background:
+        return {"ok": False,
+                "error": "redo is disabled in background mode (Blender 5.2 "
+                         "crashes on bpy.ops.ed.redo()); use the GUI session "
+                         "for redo, or re-run the script instead"}
     try:
         bpy.ops.ed.redo()
         return {"ok": True, "result": "redone"}

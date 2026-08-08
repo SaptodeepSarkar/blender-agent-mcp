@@ -169,7 +169,9 @@ r = mod.process_request({"id": 9, "type": "undo"})
 check("undo works (bg)", r.get("ok") is True and r.get("result") == "undone", json.dumps(r)[:200])
 
 r = mod.process_request({"id": 10, "type": "redo"})
-check("redo works (bg)", r.get("ok") is True and r.get("result") == "redone", json.dumps(r)[:200])
+check("redo disabled in bg (Blender 5.2 segfault guard)",
+      r.get("ok") is False and "disabled in background" in r.get("error", ""),
+      json.dumps(r)[:200])
 
 r = mod.process_request({"id": 11, "type": "context", "domain": "auto"})
 check("ctx auto in background -> scene", r.get("ok") is True and r["context"].get("_source") == "scene")

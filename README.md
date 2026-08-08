@@ -128,6 +128,11 @@ JSON-serialized).
 - Compositor tree is `scene.compositing_node_group` (`scene.node_tree` and
   `scene.use_nodes` are deprecated).
 - `bpy.ops.ed.undo()` / `redo()` / `undo_push()` work in background mode too.
+- Background-mode caveat (verified 2026-08-08): undo needs two `undo_push()`
+  calls to initialize (the add-on does this at service start), and
+  `bpy.ops.ed.redo()` **segfaults Blender 5.2** once the stack has 3+ pushed
+  steps — so `redo` returns a clear error in background mode. GUI sessions
+  (the real use case) use native undo/redo and are unaffected.
 
 ## Testing
 
