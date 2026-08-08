@@ -1,0 +1,10 @@
+# Example config for Hermes Agent (~/.hermes/config.yaml).
+# Replace the paths with your checkout location.
+mcp_servers:
+  blender_agent:
+    command: /home/USER/BlenderAnimations/blender-agent-mcp/.venv/bin/python
+    args:
+    - /home/USER/BlenderAnimations/blender-agent-mcp/server/mcp_server.py
+    timeout: 300
+    connect_timeout: 60
+    enabled: true

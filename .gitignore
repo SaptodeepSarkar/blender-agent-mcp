@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+*.pyc
+tests/test_clip.png
+.DS_Store
