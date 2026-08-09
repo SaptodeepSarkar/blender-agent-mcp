@@ -38,12 +38,40 @@ from pathlib import Path
 DEFAULT_INFO = Path.home() / ".config" / "blender-agent-mcp" / "info.json"
 INFO_PATH = Path(os.environ.get("BLENDER_AGENT_MCP_INFO", str(DEFAULT_INFO)))
 
+PORT_BASE = int(os.environ.get("BLENDER_AGENT_MCP_PORT", "9877"))
+
 NOT_RUNNING = (
     "Blender is not running, or the 'Blender Agent MCP' add-on is not active "
     "(it auto-starts when Blender opens — check 3D Viewport > Sidebar > Agent, "
     "or re-enable the add-on in Edit > Preferences > Add-ons). "
     f"Info file looked for: {INFO_PATH}"
 )
+
+
+def not_running_message() -> str:
+    """Actionable bridge-down message. If a blender-agent socket is listening
+    but info.json is gone, the add-on's poll timer died (an uncaught exception
+    in a Blender timer silently removes it) — tell the user exactly how to
+    revive it instead of the generic 'is Blender running?' text."""
+    try:
+        import socket as _s
+
+        for _port in range(PORT_BASE, PORT_BASE + 10):
+            try:
+                _sock = _s.create_connection(("127.0.0.1", _port), timeout=0.15)
+                _sock.close()
+                return (
+                    "Blender's Agent MCP socket is listening on 127.0.0.1:"
+                    f"{_port} but unresponsive — the add-on's poll timer died. "
+                    "Fix: 3D Viewport > Sidebar > Agent > 'Restart Agent MCP "
+                    "Service' (or restart Blender). "
+                    f"Info file looked for: {INFO_PATH}"
+                )
+            except OSError:
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+    return NOT_RUNNING
 
 
 class Bridge:
@@ -57,7 +85,7 @@ class Bridge:
         try:
             m = INFO_PATH.stat().st_mtime
         except OSError as exc:
-            raise RuntimeError(NOT_RUNNING) from exc
+            raise RuntimeError(not_running_message()) from exc
         if refresh or m != self._mtime:
             try:
                 self._cache = json.loads(INFO_PATH.read_text())
@@ -71,7 +99,7 @@ class Bridge:
         try:
             s = socket.create_connection(("127.0.0.1", int(info["port"])), timeout=10)
         except OSError as exc:
-            raise RuntimeError(NOT_RUNNING) from exc
+            raise RuntimeError(not_running_message()) from exc
         try:
             s.settimeout(timeout)
             rid = int(time.time() * 1000) % 10**9

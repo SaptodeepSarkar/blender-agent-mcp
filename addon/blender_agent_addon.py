@@ -72,6 +72,7 @@ MAX_TRACEBACK = 8000
 # Module state
 _srv = None          # listening socket
 _timer_fn = None     # GUI poll timer
+_hb_fn = None        # GUI watchdog timer (revives poll, keeps info.json fresh)
 _token = ""
 _port = 0
 _started = False
@@ -630,7 +631,7 @@ def _send(conn, obj):
 
 def start_service():
     """Bind the socket and (in GUI mode) register the poll timer."""
-    global _srv, _timer_fn, _token, _port, _started, _last_error
+    global _srv, _timer_fn, _hb_fn, _token, _port, _started, _last_error
     if _started:
         return {"ok": True, "message": "already running", "port": _port}
     _token = secrets.token_hex(16)
@@ -654,23 +655,26 @@ def start_service():
     _write_info()
     if bpy.app.background:
         return {"ok": True, "port": _port, "mode": "background"}
-    _timer_fn = _make_timer()
+    _timer_fn, _hb_fn = _make_timer()
     try:
         bpy.app.timers.register(_timer_fn, first_interval=0.05)
+        bpy.app.timers.register(_hb_fn, first_interval=2.0)
     except Exception as exc:  # noqa: BLE001
         _last_error = f"timer registration failed: {exc}"
-        _timer_fn = None  # panel draw will self-heal on next redraw
+        _timer_fn, _hb_fn = None, None  # panel draw will self-heal on next redraw
     else:
         print(f"[blender-agent-mcp] Blender {bpy.app.version_string} service listening on 127.0.0.1:{_port}", flush=True)
     return {"ok": True, "port": _port, "mode": "gui"}
 
 
 def stop_service():
-    global _srv, _timer_fn, _started, _token, _port
-    if _timer_fn is not None:
-        with contextlib.suppress(Exception):
-            bpy.app.timers.unregister(_timer_fn)
-        _timer_fn = None
+    global _srv, _timer_fn, _hb_fn, _started, _token, _port
+    for _fn in (_timer_fn, _hb_fn):
+        if _fn is not None:
+            with contextlib.suppress(Exception):
+                bpy.app.timers.unregister(_fn)
+    _timer_fn = None
+    _hb_fn = None
     if _srv is not None:
         try:
             _srv.close()
@@ -699,18 +703,20 @@ def _tag_redraw():
 
 
 def _make_timer():
-    """GUI-mode poller: accepts one client, reads newline-delimited requests,
-    executes them on the main thread (bpy-safe), replies, repeats."""
+    """GUI-mode poller + watchdog heartbeat.
+    poll() accepts one client, reads newline-delimited requests, executes them
+    on the main thread (bpy-safe), replies, repeats. heartbeat() keeps info.json
+    fresh and revives poll if Blender ever drops it. Both are exception-proof:
+    an uncaught exception in a Blender timer silently removes the timer, which
+    used to take the whole bridge down (orphaned socket, missing info.json)."""
     global _request_count
     st = {"conn": None, "buf": b"", "authed": False}
     _last_info_write = 0.0
 
-    def poll():
-        nonlocal _last_info_write
-        if not _started or _srv is None:
-            return None
+    def _tick():
         # self-heal the handshake file — if anything deleted info.json,
         # rewrite it on the next tick (instant), plus a 5s heartbeat
+        nonlocal _last_info_write
         now = time.time()
         if not INFO_PATH.exists() or now - _last_info_write > 5.0:
             _write_info()
@@ -770,7 +776,41 @@ def _make_timer():
                 _send(conn, {"id": msg.get("id"), "ok": False, "error": _last_error})
         return 0.05
 
-    return poll
+    def poll():
+        # Exception-proof wrapper: an uncaught exception in a Blender timer
+        # callback silently REMOVES the timer, which took the whole bridge
+        # down (socket orphaned, info.json gone, no self-heal) — the exact
+        # failure this wrapper prevents. Any tick error is logged and the
+        # timer keeps running.
+        if not _started or _srv is None:
+            return None
+        try:
+            return _tick()
+        except Exception:  # noqa: BLE001
+            global _last_error
+            _last_error = traceback.format_exc()[-4000:]
+            traceback.print_exc(file=sys.stderr)
+            return 0.05
+
+    def heartbeat():
+        # Watchdog: keeps info.json fresh even if poll died, and re-registers
+        # the poll timer if Blender ever dropped it. Exception-proof too, so
+        # it cannot die the same way. Runs at 2s cadence.
+        nonlocal _last_info_write
+        if not _started or _srv is None:
+            return None
+        try:
+            now = time.time()
+            if not INFO_PATH.exists() or now - _last_info_write > 5.0:
+                _write_info()
+                _last_info_write = now
+            if _timer_fn is not None and not bpy.app.timers.is_registered(_timer_fn):
+                bpy.app.timers.register(_timer_fn, first_interval=0.05)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc(file=sys.stderr)
+        return 2.0
+
+    return poll, heartbeat
 
 
 def _serve_blocking(conn):
