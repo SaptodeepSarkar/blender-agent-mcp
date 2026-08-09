@@ -33,7 +33,7 @@ Env overrides (optional):
 bl_info = {
     "name": "Blender Agent MCP",
     "author": "Saptodeep Sarkar",
-    "version": (1, 0, 0),
+    "version": (1, 0, 6),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar > Agent",
     "description": "Localhost service for agent-driven bpy scripting: context introspection, script execution, undo/redo.",
@@ -672,7 +672,10 @@ def stop_service():
     for _fn in (_timer_fn, _hb_fn):
         if _fn is not None:
             with contextlib.suppress(Exception):
-                bpy.app.timers.unregister(_fn)
+                # drain duplicates: Blender allows registering the same
+                # callback twice; unregister removes one entry per call
+                while bpy.app.timers.is_registered(_fn):
+                    bpy.app.timers.unregister(_fn)
     _timer_fn = None
     _hb_fn = None
     if _srv is not None:
