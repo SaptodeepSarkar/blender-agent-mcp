@@ -202,6 +202,68 @@ def run_script(code: str, checkpoint: bool = True) -> str:
 
 
 @mcp.tool()
+def select_strips(
+    type: str = "",
+    channel: int = 0,
+    name: str = "",
+    regex: str = "",
+    mode: str = "set",
+) -> str:
+    """Select VSE strips by ANY criteria — you are not bound to the user's
+    manual selection. Filters combine (AND): type ('MOVIE'/'SOUND'/'IMAGE'/
+    'META'/...), channel (>0), name (substring), regex (Python re on name).
+    mode: 'set' (replace selection, default) | 'add' (keep current too) |
+    'toggle'. Pass no filters to select all strips. Returns the selected
+    strip names + count. After this, run_script acts on YOUR selection."""
+    code = _select_code(type=type, channel=channel, name=name,
+                        regex=regex, mode=mode)
+    try:
+        resp = bridge.call({"type": "exec", "code": code,
+                            "checkpoint": False}, timeout=60)
+    except RuntimeError as exc:
+        return _out({"ok": False, "error": str(exc)})
+    return _out(resp)
+
+
+def _select_code(type: str = "", channel: int = 0, name: str = "",
+                 regex: str = "", mode: str = "set") -> str:
+    """Build a raw bpy script that selects matching VSE strips."""
+    conds = []
+    if type:
+        conds.append(f"s.type == {type!r}")
+    if channel and channel > 0:
+        conds.append(f"s.channel == {channel}")
+    if name:
+        conds.append(f"{name!r} in s.name")
+    if regex:
+        conds.append(f"_re.search({regex!r}, s.name) is not None")
+    if conds:
+        match = " and ".join(conds)
+        pick = "sel = [s for s in strips if " + match + "]"
+    else:
+        pick = "sel = list(strips)"
+    if mode == "set":
+        sel_all = "for s in strips:\n    s.select = False"
+        apply_sel = "for s in sel:\n    s.select = True"
+    elif mode == "add":
+        sel_all = "pass"
+        apply_sel = "for s in sel:\n    s.select = True"
+    else:  # toggle
+        sel_all = "pass"
+        apply_sel = "for s in sel:\n    s.select = not s.select"
+    code = (
+        "import bpy, re as _re\n"
+        "ed = bpy.context.scene.sequence_editor\n"
+        "strips = list(ed.strips) if ed else []\n"
+        + pick + "\n"
+        + sel_all + "\n"
+        + apply_sel + "\n"
+        "print(len(sel), 'selected:', [s.name for s in sel][:20])\n"
+    )
+    return code
+
+
+@mcp.tool()
 def undo() -> str:
     """Ctrl+Z in Blender: revert the last change. Use after a failed script to
     clean up its partial edits before retrying with a fixed script."""
