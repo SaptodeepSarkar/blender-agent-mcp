@@ -33,7 +33,7 @@ Env overrides (optional):
 bl_info = {
     "name": "Blender Agent MCP",
     "author": "Saptodeep Sarkar",
-    "version": (1, 0, 6),
+    "version": (1, 0, 7),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar > Agent",
     "description": "Localhost service for agent-driven bpy scripting: context introspection, script execution, undo/redo.",
@@ -623,6 +623,9 @@ def _write_info():
 
 
 def _send(conn, obj):
+    """BLOCKING-path send (background service): conn is a blocking socket here,
+    sendall cannot raise BlockingIOError. The GUI timer path must NOT use this
+    — it uses the non-blocking output queue in _make_timer()."""
     try:
         conn.sendall((json.dumps(obj) + "\n").encode("utf-8"))
     except Exception:  # noqa: BLE001
@@ -711,10 +714,52 @@ def _make_timer():
     on the main thread (bpy-safe), replies, repeats. heartbeat() keeps info.json
     fresh and revives poll if Blender ever drops it. Both are exception-proof:
     an uncaught exception in a Blender timer silently removes the timer, which
-    used to take the whole bridge down (orphaned socket, missing info.json)."""
+    used to take the whole bridge down (orphaned socket, missing info.json).
+
+    Non-blocking OUTPUT QUEUE (the choke fix): the accepted connection is
+    non-blocking, so a one-shot sendall() raises BlockingIOError the moment the
+    kernel send buffer is full (large context/exec responses, slow client) —
+    the old _send() swallowed that and the response was silently DROPPED,
+    leaving the client blocked on readline() until its 300s tool timeout
+    ("mcp is choked"). Instead, responses are queued in st['out'] and flushed
+    across ticks with conn.send(), honoring backpressure; nothing is dropped
+    and the bridge stays responsive."""
     global _request_count
-    st = {"conn": None, "buf": b"", "authed": False}
+    st = {"conn": None, "buf": b"", "out": b"", "authed": False}
     _last_info_write = 0.0
+    _dbg = {"sent": 0, "err": None, "flush_pending": 0}
+    MAX_OUT = 64 * 1024 * 1024  # hard cap: a runaway response must not OOM Blender
+
+    def _enqueue(conn, obj):
+        st["out"] += (json.dumps(obj) + "\n").encode("utf-8")
+        if len(st["out"]) > MAX_OUT:
+            st["out"] = b""
+            _enqueue(conn, {"id": obj.get("id"), "ok": False,
+                            "error": f"response exceeded {MAX_OUT} bytes — dropped"})
+        return st["out"]
+
+    def _flush():
+        """Push queued bytes to the socket. Returns True when the queue is
+        empty (or the connection died), False when the kernel buffer is full
+        and we must retry next tick."""
+        conn = st["conn"]
+        if conn is None:
+            st["out"] = b""
+            return True
+        while st["out"]:
+            try:
+                n = conn.send(st["out"])
+                st["out"] = st["out"][n:]
+                _dbg["sent"] += n
+            except BlockingIOError:
+                return False  # backpressure — retry next tick
+            except Exception as exc:  # noqa: BLE001 — conn broken, drop it
+                _dbg["err"] = (type(exc).__name__, str(exc), len(st["out"]))
+                with contextlib.suppress(Exception):
+                    conn.close()
+                st.update(conn=None, buf=b"", out=b"", authed=False)
+                return True
+        return True
 
     def _tick():
         # self-heal the handshake file — if anything deleted info.json,
@@ -728,7 +773,7 @@ def _make_timer():
             try:
                 conn, _ = _srv.accept()
                 conn.setblocking(False)
-                st.update(conn=conn, buf=b"", authed=False)
+                st.update(conn=conn, buf=b"", out=b"", authed=False)
             except BlockingIOError:
                 pass
             except Exception:  # noqa: BLE001
@@ -737,6 +782,9 @@ def _make_timer():
         if conn is None:
             _tag_redraw()
             return 0.5
+        if not _flush():
+            _dbg["flush_pending"] = len(st["out"])
+            return 0.05  # send buffer full — keep flushing, don't read yet
         try:
             data = conn.recv(65536)
         except BlockingIOError:
@@ -747,7 +795,7 @@ def _make_timer():
             # real EOF — client disconnected
             with contextlib.suppress(Exception):
                 conn.close()
-            st["conn"] = None
+            st.update(conn=None, buf=b"", out=b"", authed=False)
             return 0.05
         st["buf"] += data
         while b"\n" in st["buf"]:
@@ -757,26 +805,27 @@ def _make_timer():
             try:
                 msg = json.loads(raw.decode("utf-8"))
             except (ValueError, UnicodeDecodeError):
-                _send(conn, {"id": None, "ok": False, "error": "bad json"})
+                _enqueue(conn, {"id": None, "ok": False, "error": "bad json"})
                 continue
             if msg.get("type") == "auth":
                 if msg.get("token") == _token:
                     st["authed"] = True
-                    _send(conn, {"id": msg.get("id"), "ok": True, "result": "authenticated"})
+                    _enqueue(conn, {"id": msg.get("id"), "ok": True, "result": "authenticated"})
                 else:
-                    _send(conn, {"id": msg.get("id"), "ok": False, "error": "auth failed"})
+                    _enqueue(conn, {"id": msg.get("id"), "ok": False, "error": "auth failed"})
                 continue
             if not st["authed"]:
-                _send(conn, {"id": msg.get("id"), "ok": False, "error": "auth required"})
+                _enqueue(conn, {"id": msg.get("id"), "ok": False, "error": "auth required"})
                 continue
             global _request_count
             _request_count += 1
             try:
-                _send(conn, process_request(msg))
+                _enqueue(conn, process_request(msg))
             except Exception:  # noqa: BLE001
                 global _last_error
                 _last_error = traceback.format_exc()[-4000:]
-                _send(conn, {"id": msg.get("id"), "ok": False, "error": _last_error})
+                _enqueue(conn, {"id": msg.get("id"), "ok": False, "error": _last_error})
+        _flush()  # best-effort immediate delivery; leftover stays queued
         return 0.05
 
     def poll():
@@ -794,6 +843,9 @@ def _make_timer():
             _last_error = traceback.format_exc()[-4000:]
             traceback.print_exc(file=sys.stderr)
             return 0.05
+
+    # expose internal state for the headless regression test
+    poll._dbg = _dbg
 
     def heartbeat():
         # Watchdog: keeps info.json fresh even if poll died, and re-registers

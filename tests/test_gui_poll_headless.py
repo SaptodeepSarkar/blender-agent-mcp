@@ -9,8 +9,17 @@ import socket
 import sys
 import time
 
-sys.path.insert(0, "/home/saptodeepsarkar/BlenderAnimations/blender-agent-mcp/addon")
-import blender_agent_addon as mod  # noqa: E402
+# CRITICAL: Blender pre-imports the INSTALLED add-on copy (from
+# ~/.config/blender/5.2/scripts/addons/) into sys.modules at startup. A plain
+# `import blender_agent_addon` would silently load that STALE copy. Force-load
+# the repo copy under test from its file path instead.
+import importlib.util
+
+_REPO_ADDON = "/home/saptodeepsarkar/BlenderAnimations/blender-agent-mcp/addon/blender_agent_addon.py"
+_spec = importlib.util.spec_from_file_location("blender_agent_addon_repo", _REPO_ADDON)
+mod = importlib.util.module_from_spec(_spec)
+sys.modules["blender_agent_addon_repo"] = mod
+_spec.loader.exec_module(mod)
 
 PORT = 18987
 results = []
@@ -33,7 +42,7 @@ mod._started = True
 mod._token = "testtoken"
 mod._request_count = 0
 mod.warmup_undo()  # same as real start_service
-poll = mod._make_timer()
+poll, _hb = mod._make_timer()
 mod._timer_fn = poll  # so panel self-heal logic has a handle
 
 

@@ -126,6 +126,13 @@ class Bridge:
             req.setdefault("id", rid + 1)
             sendline(req)
             return readline()
+        except (socket.timeout, TimeoutError) as exc:
+            raise RuntimeError(
+                f"no response from Blender within {timeout}s — the bridge may be "
+                "busy (a long script is still running, or Blender is frozen). "
+                "Wait for it to finish, or use the 'Restart Agent MCP Service' "
+                "button in 3D Viewport > Sidebar > Agent."
+            ) from exc
         finally:
             s.close()
 
