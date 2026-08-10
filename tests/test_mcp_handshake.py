@@ -65,7 +65,7 @@ send({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
 send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
 r = recv()
 tools = [t["name"] for t in r.get("result", {}).get("tools", [])]
-step("tools/list", set(tools) == {"status", "context", "run_script", "undo", "redo"}, tools)
+step("tools/list", set(tools) == {"status", "context", "run_script", "select_strips", "undo", "redo"}, tools)
 
 # 4. tools/call status (Blender service should be up)
 send({"jsonrpc": "2.0", "id": 3, "method": "tools/call",

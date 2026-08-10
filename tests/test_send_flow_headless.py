@@ -97,7 +97,7 @@ def recv_until(sock, rid, timeout=20.0):
                 msg = json.loads(line)
             except ValueError:
                 continue
-            if msg.get("id") == rid:
+            if msg.get("id") == rid or msg.get("ok") is False:
                 return msg, None
         tick()
     return None, f"timeout (received {len(buf)} bytes, no newline)"
@@ -150,6 +150,25 @@ check("bridge alive after big response", msg is not None and msg.get("ok") is Tr
 c2.sendall((json.dumps({"id": 4, "type": "ping"}) + "\n").encode())
 msg, err = recv_until(c2, 4)
 check("ping after big response", msg is not None and msg.get("ok") is True, err)
+
+# --- TEST 4: second client while one is being served gets a FAST "busy"
+# error, not a silent backlog wait (v1.0.8 single-slot rejection) ---
+# c2 is still open and served; c3 connects on top of it.
+c3 = socket.create_connection(("127.0.0.1", PORT), timeout=5)
+c3.sendall((json.dumps({"id": 5, "type": "auth", "token": "testtoken"}) + "\n").encode())
+t0 = time.time()
+msg, err = recv_until(c3, 5, timeout=5.0)
+dt = time.time() - t0
+check("second client rejected fast with busy error",
+      msg is not None and msg.get("ok") is False and "busy" in str(msg.get("error", "")),
+      f"{err or ''} ({dt:.1f}s) msg={msg}")
+check("busy rejection is fast (<3s)", dt < 3.0, f"took {dt:.1f}s")
+c3.close()
+# c2 (the served connection) must still work after the rejection
+c2.sendall((json.dumps({"id": 6, "type": "ping"}) + "\n").encode())
+msg, err = recv_until(c2, 6)
+check("served connection still works after busy rejection",
+      msg is not None and msg.get("ok") is True, err)
 c2.close()
 
 srv.close()

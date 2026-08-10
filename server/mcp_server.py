@@ -121,7 +121,17 @@ class Bridge:
             sendline({"id": rid, "type": "auth", "token": info["token"]})
             auth = readline()
             if not auth.get("ok"):
-                raise RuntimeError(f"auth failed: {auth.get('error')}")
+                err = str(auth.get("error") or "unknown")
+                if "busy" in err:
+                    # single-slot bridge serving another request — retry is
+                    # pointless right now, surface the actionable message
+                    raise RuntimeError(
+                        "Blender's Agent MCP bridge is busy serving another "
+                        "request (it handles one connection at a time). Retry "
+                        "in a moment — or if this persists, use the 'Restart "
+                        "Agent MCP Service' button in 3D Viewport > Sidebar > Agent."
+                    )
+                raise RuntimeError(f"auth failed: {err}")
             req = dict(msg)
             req.setdefault("id", rid + 1)
             sendline(req)
@@ -137,9 +147,31 @@ class Bridge:
             s.close()
 
     def call(self, msg: dict, timeout: float = 120.0) -> dict:
-        """One request with a single retry on stale-token (add-on restarted)."""
+        """One request with retries for a stale info file (add-on restarted
+        or moved to a different port): first a refresh on 'auth failed', then
+        a refresh on connection-refused, then give up with the real error."""
         try:
             return self._transact(msg, timeout=timeout)
+        except RuntimeError as exc:
+            if "auth failed" in str(exc):
+                return self._transact(msg, timeout=timeout, refresh=True)
+            raise
+
+    def call_refresh_on_refused(self, msg: dict, timeout: float = 120.0) -> dict:
+        """Like call(), but also retries once after refreshing the info file
+        when the cached port refuses connections (add-on restarted and bound
+        a different port — the port-scan can shift it)."""
+        try:
+            return self.call(msg, timeout=timeout)
+        except RuntimeError as exc:
+            if "not running" in str(exc) or "socket is listening" in str(exc):
+                # stale info.json port — add-on may have restarted on a new one
+                return self.call_refreshed_once(msg, timeout=timeout)
+            raise
+
+    def call_refreshed_once(self, msg: dict, timeout: float = 120.0) -> dict:
+        try:
+            return self._transact(msg, timeout=timeout, refresh=True)
         except RuntimeError as exc:
             if "auth failed" in str(exc):
                 return self._transact(msg, timeout=timeout, refresh=True)
@@ -150,7 +182,10 @@ bridge = Bridge()
 
 
 def _out(obj) -> str:
-    return json.dumps(obj, indent=2)
+    # compact (no indent): large digests (400-strip VSE context with speeds/
+    # retiming) are re-escaped into the MCP JSON-RPC envelope; indent=2
+    # inflated them 2-4x and bloated the agent's context window
+    return json.dumps(obj, separators=(",", ":"))
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +208,7 @@ def status() -> str:
     except RuntimeError as exc:
         return _out({"ok": False, "connected": False, "error": str(exc)})
     try:
-        resp = bridge.call({"type": "ping"}, timeout=10)
+        resp = bridge.call_refresh_on_refused({"type": "ping"}, timeout=10)
         return _out({
             "ok": True,
             "connected": True,
@@ -206,7 +241,7 @@ def context(domain: str = "auto") -> str:
     Returns structured JSON. Use this BEFORE writing a script (understand the
     scene) and AFTER running one (verify the change actually happened)."""
     try:
-        resp = bridge.call({"type": "context", "domain": domain}, timeout=60)
+        resp = bridge.call_refresh_on_refused({"type": "context", "domain": domain}, timeout=60)
     except RuntimeError as exc:
         return _out({"ok": False, "error": str(exc)})
     return _out(resp)
@@ -230,7 +265,7 @@ def run_script(code: str, checkpoint: bool = True) -> str:
     fix the script, run again -> context() to verify. Never leave a failed
     script's partial changes behind."""
     try:
-        resp = bridge.call({"type": "exec", "code": code, "checkpoint": checkpoint}, timeout=300)
+        resp = bridge.call_refresh_on_refused({"type": "exec", "code": code, "checkpoint": checkpoint}, timeout=300)
     except RuntimeError as exc:
         return _out({"ok": False, "error": str(exc)})
     return _out(resp)
@@ -253,7 +288,7 @@ def select_strips(
     code = _select_code(type=type, channel=channel, name=name,
                         regex=regex, mode=mode)
     try:
-        resp = bridge.call({"type": "exec", "code": code,
+        resp = bridge.call_refresh_on_refused({"type": "exec", "code": code,
                             "checkpoint": False}, timeout=60)
     except RuntimeError as exc:
         return _out({"ok": False, "error": str(exc)})
@@ -303,7 +338,7 @@ def undo() -> str:
     """Ctrl+Z in Blender: revert the last change. Use after a failed script to
     clean up its partial edits before retrying with a fixed script."""
     try:
-        return _out(bridge.call({"type": "undo"}, timeout=30))
+        return _out(bridge.call_refresh_on_refused({"type": "undo"}, timeout=30))
     except RuntimeError as exc:
         return _out({"ok": False, "error": str(exc)})
 
@@ -312,7 +347,7 @@ def undo() -> str:
 def redo() -> str:
     """Ctrl+Shift+Z in Blender: re-apply the last undone change."""
     try:
-        return _out(bridge.call({"type": "redo"}, timeout=30))
+        return _out(bridge.call_refresh_on_refused({"type": "redo"}, timeout=30))
     except RuntimeError as exc:
         return _out({"ok": False, "error": str(exc)})
 

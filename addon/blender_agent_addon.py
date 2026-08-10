@@ -33,7 +33,7 @@ Env overrides (optional):
 bl_info = {
     "name": "Blender Agent MCP",
     "author": "Saptodeep Sarkar",
-    "version": (1, 0, 7),
+    "version": (1, 0, 8),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar > Agent",
     "description": "Localhost service for agent-driven bpy scripting: context introspection, script execution, undo/redo.",
@@ -769,63 +769,89 @@ def _make_timer():
         if not INFO_PATH.exists() or now - _last_info_write > 5.0:
             _write_info()
             _last_info_write = now
-        if st["conn"] is None:
-            try:
-                conn, _ = _srv.accept()
-                conn.setblocking(False)
-                st.update(conn=conn, buf=b"", out=b"", authed=False)
-            except BlockingIOError:
-                pass
-            except Exception:  # noqa: BLE001
-                traceback.print_exc(file=sys.stderr)
         conn = st["conn"]
-        if conn is None:
+        if conn is not None:
+            if not _flush():
+                _dbg["flush_pending"] = len(st["out"])
+                return 0.05  # send buffer full — keep flushing, don't read yet
+            try:
+                data = conn.recv(65536)
+            except BlockingIOError:
+                data = None  # no data yet — keep the connection
+            except Exception:  # noqa: BLE001
+                data = b""
+            if data == b"":
+                # real EOF — client disconnected; free the slot (recv happens
+                # BEFORE accept, so a client that closed is never mistaken for
+                # a busy bridge by the next connection)
+                with contextlib.suppress(Exception):
+                    conn.close()
+                st.update(conn=None, buf=b"", out=b"", authed=False)
+            elif data is not None:
+                st["buf"] += data
+                if len(st["buf"]) > 16 * 1024 * 1024:
+                    # protocol violation: client streamed without newline —
+                    # drop it rather than grow Blender-side memory unbounded
+                    with contextlib.suppress(Exception):
+                        conn.close()
+                    st.update(conn=None, buf=b"", out=b"", authed=False)
+                else:
+                    while b"\n" in st["buf"]:
+                        raw, st["buf"] = st["buf"].split(b"\n", 1)
+                        if not raw.strip():
+                            continue
+                        try:
+                            msg = json.loads(raw.decode("utf-8"))
+                        except (ValueError, UnicodeDecodeError):
+                            _enqueue(conn, {"id": None, "ok": False, "error": "bad json"})
+                            continue
+                        if msg.get("type") == "auth":
+                            if msg.get("token") == _token:
+                                st["authed"] = True
+                                _enqueue(conn, {"id": msg.get("id"), "ok": True, "result": "authenticated"})
+                            else:
+                                _enqueue(conn, {"id": msg.get("id"), "ok": False, "error": "auth failed"})
+                            continue
+                        if not st["authed"]:
+                            _enqueue(conn, {"id": msg.get("id"), "ok": False, "error": "auth required"})
+                            continue
+                        global _request_count
+                        _request_count += 1
+                        try:
+                            _enqueue(conn, process_request(msg))
+                        except Exception:  # noqa: BLE001
+                            global _last_error
+                            _last_error = traceback.format_exc()[-4000:]
+                            _enqueue(conn, {"id": msg.get("id"), "ok": False, "error": _last_error})
+                    _flush()  # best-effort immediate delivery; leftover stays queued
+        # accept AFTER serving: EOF from a closed client is processed first, so
+        # a fresh connection from the very next call is adopted, not rejected
+        try:
+            pend, _ = _srv.accept()
+            pend.setblocking(False)
+        except BlockingIOError:
+            pend = None
+        except Exception:  # noqa: BLE001
+            traceback.print_exc(file=sys.stderr)
+            pend = None
+        if pend is not None:
+            if st["conn"] is None:
+                st.update(conn=pend, buf=b"", out=b"", authed=False)
+            else:
+                # single-slot bridge: a second client while one is being served
+                # (stale/hung connection from an earlier hang, or a retry) gets
+                # a fast clear error instead of sitting in the backlog until
+                # its own timeout — the old choke made clients wait 300s here
+                try:
+                    pend.sendall((json.dumps({"id": None, "ok": False,
+                                              "error": "busy: another request is being served on this bridge — retry"}) + "\n").encode())
+                except Exception:  # noqa: BLE001
+                    pass
+                with contextlib.suppress(Exception):
+                    pend.close()
+        if st["conn"] is None:
             _tag_redraw()
             return 0.5
-        if not _flush():
-            _dbg["flush_pending"] = len(st["out"])
-            return 0.05  # send buffer full — keep flushing, don't read yet
-        try:
-            data = conn.recv(65536)
-        except BlockingIOError:
-            return 0.05  # no data yet — keep the connection, retry next tick
-        except Exception:  # noqa: BLE001
-            data = b""
-        if data == b"":
-            # real EOF — client disconnected
-            with contextlib.suppress(Exception):
-                conn.close()
-            st.update(conn=None, buf=b"", out=b"", authed=False)
-            return 0.05
-        st["buf"] += data
-        while b"\n" in st["buf"]:
-            raw, st["buf"] = st["buf"].split(b"\n", 1)
-            if not raw.strip():
-                continue
-            try:
-                msg = json.loads(raw.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
-                _enqueue(conn, {"id": None, "ok": False, "error": "bad json"})
-                continue
-            if msg.get("type") == "auth":
-                if msg.get("token") == _token:
-                    st["authed"] = True
-                    _enqueue(conn, {"id": msg.get("id"), "ok": True, "result": "authenticated"})
-                else:
-                    _enqueue(conn, {"id": msg.get("id"), "ok": False, "error": "auth failed"})
-                continue
-            if not st["authed"]:
-                _enqueue(conn, {"id": msg.get("id"), "ok": False, "error": "auth required"})
-                continue
-            global _request_count
-            _request_count += 1
-            try:
-                _enqueue(conn, process_request(msg))
-            except Exception:  # noqa: BLE001
-                global _last_error
-                _last_error = traceback.format_exc()[-4000:]
-                _enqueue(conn, {"id": msg.get("id"), "ok": False, "error": _last_error})
-        _flush()  # best-effort immediate delivery; leftover stays queued
         return 0.05
 
     def poll():
